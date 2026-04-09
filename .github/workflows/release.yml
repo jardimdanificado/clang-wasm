@@ -1,0 +1,224 @@
+name: Build & Release Clang WASM (Stripped)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Get latest LLVM version
+        id: ver
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/llvm/llvm-project/releases/latest | jq -r .tag_name)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-latest
+            archive: linux-x64
+
+          - name: macOS ARM64
+            os: macos-14
+            archive: macos-arm64
+
+          - name: Windows x64 MSVC
+            os: windows-latest
+            archive: windows-x64-msvc
+            msvc: true
+
+          - name: Windows x64 MinGW
+            os: windows-latest
+            archive: windows-x64-mingw
+            mingw: true
+
+    steps:
+      - name: Check if artifact already exists in release
+        id: check_release
+        shell: bash
+        run: |
+          TAG="${{ needs.prepare.outputs.version }}"
+          NAME="clang-wasm-${TAG}-${{ matrix.archive }}"
+          EXISTS=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG | jq -r ".assets[].name" | grep "$NAME" || true)
+          if [ -n "$EXISTS" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip if exists
+        if: steps.check_release.outputs.skip == 'true'
+        run: echo "Already built, skipping..."
+
+      - name: Checkout LLVM
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/llvm-project
+          ref: ${{ needs.prepare.outputs.version }}
+          fetch-depth: 1
+
+      # ---------------- Linux/macOS deps ----------------
+      - name: Install deps (Unix)
+        if: runner.os != 'Windows' && steps.check_release.outputs.skip != 'true'
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y ninja-build cmake ccache
+          else
+            brew install ninja cmake ccache
+          fi
+
+      # ---------------- Windows deps ----------------
+      - name: Setup MSVC
+        if: matrix.msvc && steps.check_release.outputs.skip != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install tools (Windows)
+        if: runner.os == 'Windows' && steps.check_release.outputs.skip != 'true'
+        run: choco install ninja cmake -y
+
+      - name: Setup MSYS2 (MinGW)
+        if: matrix.mingw && steps.check_release.outputs.skip != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-ninja mingw-w64-x86_64-cmake mingw-w64-x86_64-ccache
+
+      # ---------------- Cache ----------------
+      - name: Cache ccache
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+            C:\Users\runneradmin\.ccache
+          key: clang-${{ runner.os }}-${{ needs.prepare.outputs.version }}
+
+      # ---------------- Configure ----------------
+      - name: Configure (Unix)
+        if: runner.os != 'Windows' && steps.check_release.outputs.skip != 'true'
+        run: |
+          mkdir build && cd build
+          cmake -G Ninja ../llvm \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="WebAssembly" \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DLLVM_ENABLE_LTO=ON \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Configure (Windows MSVC)
+        if: matrix.msvc && steps.check_release.outputs.skip != 'true'
+        shell: powershell
+        run: |
+          mkdir build
+          cd build
+          cmake -G Ninja ..\llvm `
+            -DLLVM_ENABLE_PROJECTS="clang" `
+            -DLLVM_TARGETS_TO_BUILD="WebAssembly" `
+            -DCMAKE_BUILD_TYPE=MinSizeRel `
+            -DLLVM_ENABLE_LTO=ON `
+            -DLLVM_BUILD_TOOLS=OFF `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF `
+            -DCLANG_ENABLE_ARCMT=OFF `
+            -DLLVM_ENABLE_ZLIB=OFF `
+            -DLLVM_ENABLE_ZSTD=OFF `
+            -DLLVM_ENABLE_TERMINFO=OFF
+
+      - name: Configure (MinGW)
+        if: matrix.mingw && steps.check_release.outputs.skip != 'true'
+        shell: msys2 {0}
+        run: |
+          mkdir build && cd build
+          cmake -G Ninja ../llvm \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="WebAssembly" \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DLLVM_ENABLE_LTO=ON \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF
+
+      # ---------------- Build ----------------
+      - name: Build
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          cd build
+          ninja clang
+
+      # ---------------- Package ----------------
+      - name: Package
+        if: steps.check_release.outputs.skip != 'true'
+        run: |
+          mkdir dist
+          cp build/bin/clang* dist/ || true
+          cp build/bin/wasm-ld* dist/ || true
+
+      - name: Archive (Unix)
+        if: runner.os != 'Windows' && steps.check_release.outputs.skip != 'true'
+        run: |
+          tar -czf clang-wasm-${{ needs.prepare.outputs.version }}-${{ matrix.archive }}.tar.gz dist
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows' && steps.check_release.outputs.skip != 'true'
+        run: |
+          powershell Compress-Archive -Path dist\* -DestinationPath clang-wasm-${{ needs.prepare.outputs.version }}-${{ matrix.archive }}.zip
+
+      - name: Upload artifact
+        if: steps.check_release.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            *.tar.gz
+            *.zip
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    if: always()
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }}
+          body: "Stripped Clang WASM toolchain"
+          files: artifacts/**/*
